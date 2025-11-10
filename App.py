@@ -115,8 +115,21 @@ def export_data(filename="export.csv"):
     df.to_csv(filename, index=False)
     print(f"✅ Data exported to {filename}")
 
+
+def ensure_aqi_field():
+    """Ensure all existing documents have an 'aqi' field (set to None if missing)."""
+    # Add the field 'aqi' with value None to documents that don't have it
+    result = collection.update_many({"aqi": {"$exists": False}}, {"$set": {"aqi": None}})
+    if result.matched_count:
+        print(f"🔧 Updated {result.modified_count} documents to include 'aqi' field.")
+    else:
+        print("🔧 All documents already have an 'aqi' field or collection is empty.")
+
 # ========== MAIN PROGRAM ==========
 def main():
+    # Ensure existing documents have the 'aqi' column/field in MongoDB
+    ensure_aqi_field()
+
     while True:
         print("\n======== 🌦️ Weather MongoDB App ========")
         print("1️⃣  Check weather for your city")

@@ -26,11 +26,28 @@ def fetch_weather(city):
         print(f"❌ Error fetching data for {city} ({response.status_code})")
         return None
     data = response.json()
+    # Try to fetch air quality (AQI) using the coordinates from the weather response
+    aqi = None
+    try:
+        lat = data.get("coord", {}).get("lat")
+        lon = data.get("coord", {}).get("lon")
+        if lat is not None and lon is not None:
+            pollution_url = f"https://api.openweathermap.org/data/2.5/air_pollution?lat={lat}&lon={lon}&appid={API_KEY}"
+            p_resp = requests.get(pollution_url)
+            if p_resp.status_code == 200:
+                p_json = p_resp.json()
+                # OpenWeatherMap returns AQI in p_json['list'][0]['main']['aqi'] (1-5)
+                aqi = p_json.get("list", [{}])[0].get("main", {}).get("aqi")
+    except Exception:
+        # If anything goes wrong fetching AQI, leave it as None
+        aqi = None
+
     return {
         "city": city.title(),
         "temperature": data["main"]["temp"],
         "humidity": data["main"]["humidity"],
         "condition": data["weather"][0]["description"],
+        "aqi": aqi,
         "timestamp": datetime.utcnow()
     }
 
@@ -132,6 +149,10 @@ def main():
                 print(f"Temperature: {data['temperature']}°C")
                 print(f"Humidity: {data['humidity']}%")
                 print(f"Condition: {data['condition']}")
+                # AQI may not be available for older records or if fetching failed
+                aqi_val = data.get('aqi') if isinstance(data, dict) else None
+                if aqi_val is not None:
+                    print(f"AQI: {aqi_val}")
                 print(f"Last Updated: {data['timestamp']}")
         
         elif choice == "2":

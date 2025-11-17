@@ -125,6 +125,50 @@ def ensure_aqi_field():
     else:
         print("🔧 All documents already have an 'aqi' field or collection is empty.")
 
+
+def update_existing_records_with_aqi():
+    """Fetch and update AQI for all old database entries that do not have AQI."""
+    docs = list(collection.find({"aqi": {"$in": [None, "", 0]}}))
+
+    if not docs:
+        print("✔ All records already have AQI.")
+        return
+
+    print(f"🔄 Updating AQI for {len(docs)} old records...")
+
+    for doc in docs:
+        city = doc["city"]
+        
+        # Fetch new data for AQI only
+        url = f"https://api.openweathermap.org/data/2.5/weather?q={city}&appid={API_KEY}&units=metric"
+        resp = requests.get(url)
+        if resp.status_code != 200:
+            print(f"⚠ Could not update AQI for {city}")
+            continue
+
+        w = resp.json()
+        lat = w["coord"]["lat"]
+        lon = w["coord"]["lon"]
+
+        # Fetch AQI from air pollution API
+        pollution_url = f"https://api.openweathermap.org/data/2.5/air_pollution?lat={lat}&lon={lon}&appid={API_KEY}"
+        pr = requests.get(pollution_url)
+
+        if pr.status_code == 200:
+            aqi_val = pr.json()["list"][0]["main"]["aqi"]
+
+            # Update MongoDB
+            collection.update_one(
+                {"city": city},
+                {"$set": {"aqi": aqi_val}}
+            )
+
+            print(f"✔ Updated AQI for {city} → {aqi_val}")
+        else:
+            print(f"⚠ AQI fetch failed for {city}")
+
+    print("🎉 All old records updated with AQI!")
+
 # ========== MAIN PROGRAM ==========
 def main():
     # Ensure existing documents have the 'aqi' column/field in MongoDB

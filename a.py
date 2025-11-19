@@ -1,435 +1,531 @@
-from pymongo import MongoClient
-import requests
+"""
+MongoDB Weather App - Complete Implementation
+All data operations use MongoDB queries only (no pandas for analysis)
+"""
+
+import os
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+import requests
+from pymongo import MongoClient
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
-import numpy as np
-import io
-import base64
-import json
-import os
-from bson.son import SON
 
-# ============= CONFIGURATION =============
-API_KEY = "93422728e4501fcf10e7c914f76fd733"  # Your OpenWeatherMap API Key
-MONGO_URI = "mongodb://localhost:27017"
-DB_NAME = "weather_cache_db"
+# Configuration
+MONGO_URI = "mongodb://localhost:27017/"
+DB_NAME = "weather_app"
 COLLECTION_NAME = "weather_data"
-CACHE_HOURS = 1
-PLOTS_DIR = "plots"
-os.makedirs(PLOTS_DIR, exist_ok=True)
-# =========================================
+OPENWEATHER_API_KEY = "93422728e4501fcf10e7c914f76fd733"
+TIMEZONE = ZoneInfo("Asia/Kolkata")
+CACHE_DURATION = timedelta(hours=1)
 
-# Connect to MongoDB
+# Default cities to track
+DEFAULT_CITIES = ["Delhi", "Mumbai", "Bangalore", "Chennai", "Kolkata"]
+
+# Initialize MongoDB
 client = MongoClient(MONGO_URI)
 db = client[DB_NAME]
 collection = db[COLLECTION_NAME]
 
-# ---------------- (your existing fetch/cache/save/show functions) ----------------
-# ... (copy your existing fetch_weather, get_cached, save_to_db, show_all_data, ensure_aqi_field, update_existing_records_with_aqi, export_data) ...
-# For brevity in this file, assume they are included unchanged above (or copy-paste from your provided script).
-# ---------------------------------------------------------------------------------
+# Create indexes for better performance
+collection.create_index([("city", 1), ("timestamp", -1)])
+collection.create_index("timestamp")
 
-# ========== NEW / EXTENDED ANALYSIS FUNCTIONS ==========
 
-def _to_iso_b64_img(fig, filename=None):
-    """Save matplotlib figure to PNG buffer and return base64 string. Optionally save to plots dir."""
-    buf = io.BytesIO()
-    fig.tight_layout()
-    fig.savefig(buf, format="png", bbox_inches="tight")
-    buf.seek(0)
-    b64 = base64.b64encode(buf.read()).decode("utf-8")
-    if filename:
-        filepath = os.path.join(PLOTS_DIR, filename)
-        with open(filepath, "wb") as f:
-            f.write(base64.b64decode(b64))
-    plt.close(fig)
-    return b64
+def get_current_time():
+    """Get current time in Asia/Kolkata timezone"""
+    return datetime.now(TIMEZONE)
 
-def generate_plots(df, cities_selected):
-    """Generate required plots from dataframe and return dict of base64 images (and optionally save files)."""
-    images = {}
 
-    # Ensure timestamp is datetime
-    if "timestamp" in df.columns:
-        df["timestamp"] = pd.to_datetime(df["timestamp"])
-    else:
-        df["timestamp"] = pd.to_datetime(df.get("date", pd.Series([])))
+def is_cache_valid(timestamp):
+    """Check if cached data is less than 1 hour old"""
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=TIMEZONE)
+    return (get_current_time() - timestamp) < CACHE_DURATION
 
-    # 1. Temperature Trend (Line Plot) - by city
-    fig, ax = plt.subplots(figsize=(10,4))
-    for city, g in df.groupby("city"):
-        if (cities_selected is None) or (city in cities_selected):
-            g_sorted = g.sort_values("timestamp")
-            ax.plot(g_sorted["timestamp"], g_sorted["temperature"], label=city)
-    ax.set_title("Temperature Trend")
-    ax.set_xlabel("Date")
-    ax.set_ylabel("Temperature (°C)")
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
-    ax.legend()
-    images["temperature_trend"] = _to_iso_b64_img(fig, "temperature_trend.png")
 
-    # 2. AQI Trend
-    fig, ax = plt.subplots(figsize=(10,4))
-    if "aqi" in df.columns:
-        for city, g in df.groupby("city"):
-            if (cities_selected is None) or (city in cities_selected):
-                g_sorted = g.sort_values("timestamp")
-                ax.plot(g_sorted["timestamp"], g_sorted["aqi"], label=city)
-    ax.set_title("AQI Trend")
-    ax.set_xlabel("Date")
-    ax.set_ylabel("AQI")
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
-    ax.legend()
-    images["aqi_trend"] = _to_iso_b64_img(fig, "aqi_trend.png")
-
-    # 3. Monthly Rainfall (Bar Chart) - requires 'rain' or 'rainfall' column; try to infer 'rain' or 0
-    if "rain" not in df.columns:
-        df["rain"] = df.get("rainfall", 0)
-        df["rain"] = df["rain"].fillna(0)
-    df["month"] = df["timestamp"].dt.to_period("M").astype(str)
-    monthly_rain = df.groupby("month")["rain"].sum().reset_index()
-    fig, ax = plt.subplots(figsize=(10,4))
-    ax.bar(monthly_rain["month"], monthly_rain["rain"])
-    ax.set_title("Monthly Total Rainfall")
-    ax.set_xlabel("Month")
-    ax.set_ylabel("Total Rainfall")
-    plt.xticks(rotation=45)
-    images["monthly_rainfall"] = _to_iso_b64_img(fig, "monthly_rainfall.png")
-
-    # 4. Box Plot for Outliers (temperature, humidity, aqi)
-    fig, ax = plt.subplots(nrows=1, ncols=3, figsize=(12,4))
-    metrics = ["temperature", "humidity", "aqi"]
-    for i, m in enumerate(metrics):
-        data = df[m].dropna() if m in df.columns else pd.Series([])
-        ax[i].boxplot(data, vert=True)
-        ax[i].set_title(m)
-    images["box_plots"] = _to_iso_b64_img(fig, "box_plots.png")
-
-    # 5. City-wise Comparison (Average Temp, Avg AQI, Total Rain)
-    city_stats = df.groupby("city").agg({
-        "temperature": "mean",
-        "aqi": "mean",
-        "rain": "sum",
-        "humidity": "mean"
-    }).reset_index().fillna(0)
-    # We'll generate a grouped bar for avg temperature and avg AQI for selected cities
-    fig, ax = plt.subplots(figsize=(10,5))
-    x = np.arange(len(city_stats))
-    width = 0.35
-    ax.bar(x - width/2, city_stats["temperature"], width, label="Avg Temp")
-    ax.bar(x + width/2, city_stats["aqi"], width, label="Avg AQI")
-    ax.set_xticks(x)
-    ax.set_xticklabels(city_stats["city"], rotation=45)
-    ax.set_title("City-wise Comparison: Avg Temp vs Avg AQI")
-    ax.legend()
-    images["city_comparison"] = _to_iso_b64_img(fig, "city_comparison.png")
-
-    return images
-
-def detect_outliers_iqr(series):
-    """Return boolean mask of outliers using IQR method."""
-    if series.dropna().empty:
-        return pd.Series([False]*len(series), index=series.index)
-    q1 = series.quantile(0.25)
-    q3 = series.quantile(0.75)
-    iqr = q3 - q1
-    lower = q1 - 1.5 * iqr
-    upper = q3 + 1.5 * iqr
-    return (series < lower) | (series > upper)
-
-def analyze_data(cities=None, start_date=None, end_date=None, save_json=True):
-    """
-    Perform full weather data analysis.
-    - cities: list of city names (strings) to focus on; if None -> all cities
-    - start_date, end_date: optional datetimes (inclusive)
-    Returns: analysis_result (dict)
-    """
-    query = {}
-    if cities:
-        query["city"] = {"$in": [c.title() for c in cities]}
-    if start_date or end_date:
-        ts_query = {}
-        if start_date:
-            ts_query["$gte"] = pd.to_datetime(start_date)
-        if end_date:
-            ts_query["$lte"] = pd.to_datetime(end_date)
-        query["timestamp"] = ts_query
-
-    # fetch documents
-    docs = list(collection.find(query, {"_id": 0}))
-    if not docs:
-        print("❌ No data available for analysis with the given filters.")
-        return {}
-
-    df = pd.DataFrame(docs)
-    # ensure timestamp is datetime
-    if "timestamp" in df.columns:
-        df["timestamp"] = pd.to_datetime(df["timestamp"])
-    else:
-        # try common alternatives
-        if "date" in df.columns:
-            df["timestamp"] = pd.to_datetime(df["date"])
-        else:
-            df["timestamp"] = pd.to_datetime(df.index)
-
-    # Basic summary
-    total_records = len(df)
-    unique_cities = sorted(df["city"].dropna().unique().tolist())
-    earliest = df["timestamp"].min()
-    latest = df["timestamp"].max()
-
-    basic_summary = {
-        "total_records": int(total_records),
-        "unique_cities": unique_cities,
-        "earliest_timestamp": str(earliest),
-        "latest_timestamp": str(latest)
-    }
-
-    # City-level summary (for each selected city)
-    city_summary = {}
-    for city, g in df.groupby("city"):
-        city_dict = {
-            "average_temperature": float(g["temperature"].mean()) if "temperature" in g else None,
-            "min_temperature": float(g["temperature"].min()) if "temperature" in g else None,
-            "max_temperature": float(g["temperature"].max()) if "temperature" in g else None,
-            "average_humidity": float(g["humidity"].mean()) if "humidity" in g else None,
-            "average_wind_speed": float(g["wind_speed"].mean()) if "wind_speed" in g else None,
-            "average_aqi": float(g["aqi"].mean()) if "aqi" in g else None,
-            "total_rainfall": float(g.get("rain", g.get("rainfall", pd.Series([0]))).fillna(0).sum()),
-            "condition_counts": g["condition"].value_counts().to_dict() if "condition" in g else {}
-        }
-        city_summary[city] = city_dict
-
-    # Time-based summaries
-    now = latest
-    last_7 = df[df["timestamp"] >= (now - pd.Timedelta(days=7))]
-    last_30 = df[df["timestamp"] >= (now - pd.Timedelta(days=30))]
-
-    def make_time_summary(sub_df):
-        if sub_df.empty:
-            return {}
-        month_avg_temp = sub_df.set_index("timestamp").resample("M")["temperature"].mean().dropna().to_dict()
-        month_total_rain = sub_df.set_index("timestamp").resample("M").apply(lambda s: s.get("rain", s.get("rainfall", 0)).sum() if "rain" in s else 0)
-        # simpler monthly rain using groupby month:
-        monthly = sub_df.copy()
-        monthly["month"] = monthly["timestamp"].dt.to_period("M").astype(str)
-        month_total_rain = monthly.groupby("month").apply(lambda g: float(g.get("rain", g.get("rainfall", pd.Series([0]))).fillna(0).sum())).to_dict()
-        month_avg_aqi = monthly.groupby("month")["aqi"].mean().dropna().to_dict() if "aqi" in monthly else {}
-        return {
-            "count": int(len(sub_df)),
-            "avg_temperature": float(sub_df["temperature"].mean()) if "temperature" in sub_df else None,
-            "avg_humidity": float(sub_df["humidity"].mean()) if "humidity" in sub_df else None,
-            "avg_aqi": float(sub_df["aqi"].mean()) if "aqi" in sub_df else None,
-            "monthly_avg_temperature": {k: float(v) for k,v in month_avg_temp.items()},
-            "monthly_total_rainfall": {k: float(v) for k,v in month_total_rain.items()},
-            "monthly_avg_aqi": {k: float(v) for k,v in month_avg_aqi.items()}
-        }
-
-    last_7_summary = make_time_summary(last_7)
-    last_30_summary = make_time_summary(last_30)
-
-    # Monthly aggregates over entire dataset
-    df["month"] = df["timestamp"].dt.to_period("M").astype(str)
-    monthly_avg_temperature = df.groupby("month")["temperature"].mean().dropna().to_dict() if "temperature" in df else {}
-    monthly_total_rainfall = df.groupby("month").apply(lambda g: float(g.get("rain", g.get("rainfall", pd.Series([0]))).fillna(0).sum())).to_dict()
-    monthly_avg_aqi = df.groupby("month")["aqi"].mean().dropna().to_dict() if "aqi" in df else {}
-
-    # Trend analysis: prepare small series objects (sampled / aggregated by day to keep size reasonable)
-    df_day = df.set_index("timestamp").groupby("city").resample("D").mean().reset_index()
-    # Temperature trend per city: for JSON, we can provide last N days values
-    temp_trends = {}
-    aqi_trends = {}
-    rain_trends = {}
-    humidity_trends = {}
-    for city, g in df_day.groupby("city"):
-        g_sorted = g.sort_values("timestamp")
-        temp_trends[city] = [{"date": str(row["timestamp"].date()), "temperature": None if pd.isna(row["temperature"]) else float(row["temperature"])} for _, row in g_sorted.iterrows()]
-        if "aqi" in g:
-            aqi_trends[city] = [{"date": str(row["timestamp"].date()), "aqi": None if pd.isna(row["aqi"]) else float(row["aqi"])} for _, row in g_sorted.iterrows()]
-        rain_trends[city] = [{"date": str(row["timestamp"].date()), "rain": None if "rain" not in row or pd.isna(row.get("rain")) else float(row.get("rain"))} for _, row in g_sorted.iterrows()]
-        humidity_trends[city] = [{"date": str(row["timestamp"].date()), "humidity": None if pd.isna(row["humidity"]) else float(row["humidity"])} for _, row in g_sorted.iterrows()]
-
-    # Extreme weather analysis
-    hottest = df.loc[df["temperature"].idxmax()] if "temperature" in df else None
-    coldest = df.loc[df["temperature"].idxmin()] if "temperature" in df else None
-    highest_rain = df.loc[df["rain"].fillna(0).idxmax()] if "rain" in df or "rainfall" in df else None
-    highest_aqi = df.loc[df["aqi"].idxmax()] if "aqi" in df else None
-    lowest_aqi = df.loc[df["aqi"].idxmin()] if "aqi" in df else None
-
-    def row_to_summary(row, fields):
-        if row is None:
-            return None
-        return {f: (None if f not in row or pd.isna(row[f]) else (str(row[f]) if isinstance(row[f], (np.datetime64, pd.Timestamp)) else float(row[f]) if isinstance(row[f], (int, float, np.integer, np.floating)) else row[f])) for f in fields}
-
-    extreme = {
-        "hottest_day": row_to_summary(hottest, ["city", "temperature", "timestamp", "condition"]) if hottest is not None else None,
-        "coldest_day": row_to_summary(coldest, ["city", "temperature", "timestamp", "condition"]) if coldest is not None else None,
-        "highest_rainfall_day": row_to_summary(highest_rain, ["city", "rain", "timestamp", "condition"]) if highest_rain is not None else None,
-        "highest_aqi_day": row_to_summary(highest_aqi, ["city", "aqi", "timestamp"]) if highest_aqi is not None else None,
-        "lowest_aqi_day": row_to_summary(lowest_aqi, ["city", "aqi", "timestamp"]) if lowest_aqi is not None else None
-    }
-
-    # City comparison (if multiple cities provided or overall for all cities)
-    comp_df = df.copy()
-    comp_df["rain"] = comp_df.get("rain", comp_df.get("rainfall", 0)).fillna(0)
-    city_comparison = comp_df.groupby("city").agg({
-        "temperature": "mean",
-        "aqi": "mean",
-        "rain": "sum",
-        "humidity": "mean"
-    }).reset_index().fillna(0).to_dict(orient="records")
-
-    # Data quality checks
-    missing_values = df.isnull().sum().to_dict()
-    null_fields = {k: int(df[k].isnull().sum()) for k in df.columns}
-    outliers = {
-        "temperature_outliers_count": int(detect_outliers_iqr(df["temperature"]).sum()) if "temperature" in df else 0,
-        "humidity_outliers_count": int(detect_outliers_iqr(df["humidity"]).sum()) if "humidity" in df else 0,
-        "aqi_outliers_count": int(detect_outliers_iqr(df["aqi"]).sum()) if "aqi" in df else 0,
-    }
-
-    # Generate plots
-    images = generate_plots(df, cities_selected=[c.title() for c in cities] if cities else None)
-
-    # Build the final JSON result
-    analysis_result = {
-        "basic_summary": basic_summary,
-        "city_summary": city_summary,
-        "time_based": {
-            "last_7_days": last_7_summary,
-            "last_30_days": last_30_summary,
-            "monthly_avg_temperature": {k: float(v) for k,v in monthly_avg_temperature.items()},
-            "monthly_total_rainfall": {k: float(v) for k,v in monthly_total_rainfall.items()},
-            "monthly_avg_aqi": {k: float(v) for k,v in monthly_avg_aqi.items()}
-        },
-        "trends": {
-            "temperature_trends": temp_trends,
-            "aqi_trends": aqi_trends,
-            "rain_trends": rain_trends,
-            "humidity_trends": humidity_trends
-        },
-        "extremes": extreme,
-        "city_comparison": city_comparison,
-        "data_quality": {
-            "missing_values": missing_values,
-            "null_fields": null_fields,
-            "outlier_counts": outliers
-        },
-        "plots_base64": images
-    }
-
-    # Save to JSON file
-    if save_json:
-        with open("analysis_result.json", "w") as f:
-            json.dump(analysis_result, f, indent=2, default=str)
-
-    # Print a concise human summary
-    print("\n======== BASIC SUMMARY ========")
-    print(f"Total records: {basic_summary['total_records']}")
-    print(f"Cities: {', '.join(basic_summary['unique_cities'])}")
-    print(f"Date range: {basic_summary['earliest_timestamp']} → {basic_summary['latest_timestamp']}")
-
-    print("\n======== SAMPLE CITY SUMMARY (first 3) ========")
-    for i, (city, cs) in enumerate(city_summary.items()):
-        if i >= 3: break
-        print(f"\nCity: {city}")
-        print(f" Avg Temp: {cs['average_temperature']}")
-        print(f" Avg AQI: {cs['average_aqi']}")
-        print(f" Total Rain: {cs['total_rainfall']}")
-        print(f" Conditions (top 5): {list(cs['condition_counts'].items())[:5]}")
-
-    print("\n======== EXTREMES ========")
-    for k, v in extreme.items():
-        print(f"{k}: {v}")
-
-    print("\nPlots saved to the 'plots/' directory and also embedded as base64 in the JSON output.")
-
-    return analysis_result
-
-# ========== MAIN PROGRAM (menu) ==========
-def main():
-    # Ensure 'aqi' field exists on existing documents to avoid KeyErrors
+def fetch_openweather_data(city):
+    """Fetch weather data from OpenWeatherMap API"""
     try:
-        ensure_aqi_field()
-    except NameError:
-        # define a minimal ensure_aqi_field here if it's missing from imports
-        def ensure_aqi_field():
-            """Ensure all existing documents have an 'aqi' field (set to None if missing)."""
-            try:
-                result = collection.update_many({"aqi": {"$exists": False}}, {"$set": {"aqi": None}})
-                if getattr(result, 'modified_count', 0):
-                    print(f"🔧 Updated {result.modified_count} documents to include 'aqi' field.")
-                else:
-                    print("🔧 All documents already have an 'aqi' field or collection is empty.")
-            except Exception as e:
-                print(f"⚠️ Failed to ensure 'aqi' field on documents: {e}")
-
-        # call the fallback implementation
-        ensure_aqi_field()
-
-    while True:
-        print("\n======== 🌦️ Weather MongoDB App ========")
-        print("1️⃣  Check weather for your city")
-        print("2️⃣  View all stored data")
-        print("3️⃣  Analyze stored data (extended)")
-        print("4️⃣  Export data as CSV")
-        print("5️⃣  Exit")
+        # Current weather
+        weather_url = f"http://api.openweathermap.org/data/2.5/weather?q={city}&appid={OPENWEATHER_API_KEY}&units=metric"
+        weather_response = requests.get(weather_url, timeout=10)
+        weather_response.raise_for_status()
+        weather_data = weather_response.json()
         
-        choice = input("\nEnter your choice (1-5): ").strip()
+        # Air quality with components
+        lat = weather_data['coord']['lat']
+        lon = weather_data['coord']['lon']
+        aqi_url = f"http://api.openweathermap.org/data/2.5/air_pollution?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}"
         
-        if choice == "1":
-            city = input("Enter city name: ").strip()
-            if not city:
-                print("⚠️ Please enter a valid city name.")
-                continue
+        aqi_value = None
+        aqi_category = None
+        pm25 = None
+        pm10 = None
+        
+        try:
+            aqi_response = requests.get(aqi_url, timeout=10)
+            aqi_response.raise_for_status()
+            aqi_data = aqi_response.json()
             
-            cached = get_cached(city)
-            if cached:
-                print(f"✅ Using cached data for {city.title()}")
-                data = cached
-            else:
-                print(f"🌐 Fetching live data for {city.title()}...")
-                data = fetch_weather(city)
-                if data:
-                    save_to_db(data)
-            
+            if aqi_data and 'list' in aqi_data and len(aqi_data['list']) > 0:
+                aqi_info = aqi_data['list'][0]
+                aqi_value = aqi_info['main']['aqi']
+                
+                # AQI categories (OpenWeatherMap scale: 1-5)
+                aqi_categories = {
+                    1: "Good",
+                    2: "Fair",
+                    3: "Moderate",
+                    4: "Poor",
+                    5: "Very Poor"
+                }
+                aqi_category = aqi_categories.get(aqi_value, "Unknown")
+                
+                # Get PM2.5 and PM10 values
+                components = aqi_info.get('components', {})
+                pm25 = components.get('pm2_5')
+                pm10 = components.get('pm10')
+                
+        except Exception as aqi_error:
+            print(f"Warning: Could not fetch AQI data for {city}: {aqi_error}")
+        
+        return {
+            'city': city,
+            'temperature': weather_data['main']['temp'],
+            'humidity': weather_data['main']['humidity'],
+            'condition': weather_data['weather'][0]['description'],
+            'aqi': aqi_value,
+            'aqi_category': aqi_category,
+            'pm25': pm25,
+            'pm10': pm10,
+            'timestamp': get_current_time()
+        }
+    except Exception as e:
+        print(f"Error fetching data for {city}: {e}")
+        return None
+
+
+def check_weather(city):
+    """Option 1: Check weather with 1-hour caching"""
+    print(f"\n🌤️  Checking weather for {city}...")
+    
+    # Query MongoDB for latest record
+    latest_record = collection.find_one(
+        {"city": city},
+        sort=[("timestamp", -1)]
+    )
+    
+    # Check if cache is valid
+    if latest_record and is_cache_valid(latest_record['timestamp']):
+        print("✅ Using cached data (less than 1 hour old)")
+        data = latest_record
+    else:
+        print("🔄 Fetching fresh data from API...")
+        data = fetch_openweather_data(city)
+        if data:
+            collection.insert_one(data)
+            print("💾 Data stored in MongoDB")
+        else:
+            print("❌ Failed to fetch data")
+            return
+    
+    # Display weather information
+    print(f"\n📍 City: {data['city']}")
+    print(f"🌡️  Temperature: {data['temperature']}°C")
+    print(f"💧 Humidity: {data['humidity']}%")
+    print(f"☁️  Condition: {data['condition']}")
+    
+    if data['aqi']:
+        print(f"🏭 AQI: {data['aqi']} ({data['aqi_category']})")
+        if data['pm25']:
+            print(f"   PM2.5: {data['pm25']:.1f} µg/m³")
+        if data['pm10']:
+            print(f"   PM10: {data['pm10']:.1f} µg/m³")
+    else:
+        print(f"🏭 AQI: N/A")
+    
+    print(f"🕐 Timestamp: {data['timestamp'].strftime('%Y-%m-%d %I:%M:%S %p')}")
+
+
+def basic_summary():
+    """Option 2: Basic summary using MongoDB aggregation"""
+    print("\n📊 BASIC SUMMARY")
+    
+    # Check if we need fresh data
+    latest_doc = collection.find_one(sort=[("timestamp", -1)])
+    
+    if not latest_doc or not is_cache_valid(latest_doc['timestamp']):
+        print("🔄 Database empty or outdated. Fetching fresh data for all cities...")
+        for city in DEFAULT_CITIES:
+            data = fetch_openweather_data(city)
             if data:
-                print("\nCurrent Weather:")
-                print(f"City: {data['city']}")
-                print(f"Temperature: {data['temperature']}°C")
-                print(f"Humidity: {data['humidity']}%")
-                print(f"Condition: {data['condition']}")
-                aqi_val = data.get('aqi') if isinstance(data, dict) else None
-                if aqi_val is not None:
-                    print(f"AQI: {aqi_val}")
-                print(f"Last Updated: {data['timestamp']}")
+                collection.insert_one(data)
+        print("✅ Fresh data inserted\n")
+    
+    # MongoDB aggregation pipeline
+    pipeline = [
+        {
+            "$group": {
+                "_id": None,
+                "total_records": {"$sum": 1},
+                "cities": {"$addToSet": "$city"},
+                "earliest": {"$min": "$timestamp"},
+                "latest": {"$max": "$timestamp"}
+            }
+        }
+    ]
+    
+    result = list(collection.aggregate(pipeline))
+    
+    if result:
+        summary = result[0]
+        print(f"📝 Total Records: {summary['total_records']}")
+        print(f"🌍 Unique Cities: {len(summary['cities'])}")
+        print(f"   Cities: {', '.join(sorted(summary['cities']))}")
+        print(f"📅 Earliest Entry: {summary['earliest'].strftime('%Y-%m-%d %I:%M:%S %p')}")
+        print(f"📅 Latest Entry: {summary['latest'].strftime('%Y-%m-%d %I:%M:%S %p')}")
+    else:
+        print("❌ No data in database")
+
+
+def city_level_summary(city):
+    """Option 3: City-level summary using MongoDB aggregation"""
+    print(f"\n📊 CITY-LEVEL SUMMARY: {city}")
+    
+    # Check if we need fresh data for this city
+    latest_record = collection.find_one(
+        {"city": city},
+        sort=[("timestamp", -1)]
+    )
+    
+    if not latest_record or not is_cache_valid(latest_record['timestamp']):
+        print("🔄 Fetching fresh data...")
+        data = fetch_openweather_data(city)
+        if data:
+            collection.insert_one(data)
+            print("✅ Fresh data inserted\n")
+    
+    # MongoDB aggregation pipeline
+    pipeline = [
+        {"$match": {"city": city}},
+        {
+            "$group": {
+                "_id": "$city",
+                "avg_temp": {"$avg": "$temperature"},
+                "min_temp": {"$min": "$temperature"},
+                "max_temp": {"$max": "$temperature"},
+                "avg_humidity": {"$avg": "$humidity"},
+                "avg_aqi": {"$avg": "$aqi"},
+                "total_records": {"$sum": 1}
+            }
+        }
+    ]
+    
+    result = list(collection.aggregate(pipeline))
+    
+    if result:
+        summary = result[0]
+        print(f"📝 Total Records: {summary['total_records']}")
+        print(f"🌡️  Temperature: {summary['avg_temp']:.2f}°C (Min: {summary['min_temp']:.2f}°C, Max: {summary['max_temp']:.2f}°C)")
+        print(f"💧 Average Humidity: {summary['avg_humidity']:.2f}%")
+        if summary['avg_aqi']:
+            print(f"🏭 Average AQI: {summary['avg_aqi']:.2f}")
+        else:
+            print(f"🏭 Average AQI: N/A")
+    else:
+        print(f"❌ No data found for {city}")
+
+
+def extreme_weather_days():
+    """Option 4: Extreme weather days using MongoDB queries"""
+    print("\n🌡️  EXTREME WEATHER DAYS")
+    
+    # Get current date boundaries (today in Asia/Kolkata timezone)
+    today_start = get_current_time().replace(hour=0, minute=0, second=0, microsecond=0)
+    today_end = get_current_time().replace(hour=23, minute=59, second=59, microsecond=999999)
+    
+    # Check if we have today's data
+    today_records = collection.count_documents({
+        "timestamp": {"$gte": today_start, "$lte": today_end}
+    })
+    
+    if today_records == 0 or not is_cache_valid(collection.find_one(sort=[("timestamp", -1)])['timestamp']):
+        print("🔄 Fetching fresh data for all cities...")
+        for city in DEFAULT_CITIES:
+            data = fetch_openweather_data(city)
+            if data:
+                collection.insert_one(data)
+        print("✅ Fresh data inserted\n")
+    
+    # Filter for today's records only
+    today_filter = {"timestamp": {"$gte": today_start, "$lte": today_end}}
+    
+    # Hottest city today
+    hottest = collection.find_one(
+        today_filter,
+        sort=[("temperature", -1)]
+    )
+    if hottest:
+        print(f"🔥 HOTTEST TODAY (India): {hottest['city']} - {hottest['temperature']}°C")
+        print(f"   Time: {hottest['timestamp'].strftime('%Y-%m-%d %I:%M:%S %p')}")
+    
+    # Coldest city today
+    coldest = collection.find_one(
+        today_filter,
+        sort=[("temperature", 1)]
+    )
+    if coldest:
+        print(f"\n❄️  COLDEST TODAY (India): {coldest['city']} - {coldest['temperature']}°C")
+        print(f"   Time: {coldest['timestamp'].strftime('%Y-%m-%d %I:%M:%S %p')}")
+    
+    # Highest AQI today
+    highest_aqi = collection.find_one(
+        {**today_filter, "aqi": {"$ne": None}},
+        sort=[("aqi", -1)]
+    )
+    if highest_aqi:
+        aqi_display = f"{highest_aqi['aqi']} ({highest_aqi.get('aqi_category', 'N/A')})"
+        print(f"\n🏭 HIGHEST AQI TODAY (India): {highest_aqi['city']} - {aqi_display}")
+        if highest_aqi.get('pm25'):
+            print(f"   PM2.5: {highest_aqi['pm25']:.1f} µg/m³, PM10: {highest_aqi.get('pm10', 0):.1f} µg/m³")
+        print(f"   Time: {highest_aqi['timestamp'].strftime('%Y-%m-%d %I:%M:%S %p')}")
+    
+    # Lowest AQI today
+    lowest_aqi = collection.find_one(
+        {**today_filter, "aqi": {"$ne": None}},
+        sort=[("aqi", 1)]
+    )
+    if lowest_aqi:
+        aqi_display = f"{lowest_aqi['aqi']} ({lowest_aqi.get('aqi_category', 'N/A')})"
+        print(f"\n🌿 LOWEST AQI TODAY (India): {lowest_aqi['city']} - {aqi_display}")
+        if lowest_aqi.get('pm25'):
+            print(f"   PM2.5: {lowest_aqi['pm25']:.1f} µg/m³, PM10: {lowest_aqi.get('pm10', 0):.1f} µg/m³")
+        print(f"   Time: {lowest_aqi['timestamp'].strftime('%Y-%m-%d %I:%M:%S %p')}")
+    
+    # World extremes (fetch live)
+    print("\n" + "="*60)
+    print("🌍 WORLD EXTREMES (Live Data)")
+    print("="*60)
+    
+    # Known hot and cold cities worldwide
+    world_hot_cities = ["Kuwait City", "Dubai", "Phoenix", "Las Vegas", "Cairo"]
+    world_cold_cities = ["Yakutsk", "Norilsk", "Anchorage", "Reykjavik", "Oslo"]
+    
+    print("\n🔥 Checking hottest cities worldwide...")
+    world_hottest_temp = -999
+    world_hottest_city = None
+    
+    for city in world_hot_cities:
+        data = fetch_openweather_data(city)
+        if data and data['temperature'] > world_hottest_temp:
+            world_hottest_temp = data['temperature']
+            world_hottest_city = data
+    
+    if world_hottest_city:
+        print(f"🔥 HOTTEST (World): {world_hottest_city['city']} - {world_hottest_city['temperature']}°C")
+        print(f"   Time: {world_hottest_city['timestamp'].strftime('%Y-%m-%d %I:%M:%S %p')}")
+    
+    print("\n❄️  Checking coldest cities worldwide...")
+    world_coldest_temp = 999
+    world_coldest_city = None
+    
+    for city in world_cold_cities:
+        data = fetch_openweather_data(city)
+        if data and data['temperature'] < world_coldest_temp:
+            world_coldest_temp = data['temperature']
+            world_coldest_city = data
+    
+    if world_coldest_city:
+        print(f"❄️  COLDEST (World): {world_coldest_city['city']} - {world_coldest_city['temperature']}°C")
+        print(f"   Time: {world_coldest_city['timestamp'].strftime('%Y-%m-%d %I:%M:%S %p')}")
+
+
+def geocode_city(city):
+    """Geocode city name to coordinates using OpenWeatherMap"""
+    try:
+        url = f"http://api.openweathermap.org/geo/1.0/direct?q={city}&limit=1&appid={OPENWEATHER_API_KEY}"
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        if data:
+            return data[0]['lat'], data[0]['lon']
+    except Exception as e:
+        print(f"Error geocoding {city}: {e}")
+    return None, None
+
+
+def weekly_temperature_chart(city):
+    """Option 5: Weekly temperature chart using Open-Meteo (no DB)"""
+    print(f"\n📈 WEEKLY TEMPERATURE CHART: {city}")
+    
+    # Geocode city
+    print("🔍 Geocoding city...")
+    lat, lon = geocode_city(city)
+    if not lat or not lon:
+        print("❌ Could not geocode city")
+        return
+    
+    print(f"📍 Coordinates: {lat}, {lon}")
+    
+    # Fetch 7 days of hourly data from Open-Meteo
+    end_date = datetime.now().date()
+    start_date = end_date - timedelta(days=7)
+    
+    url = f"https://archive-api.open-meteo.com/v1/archive"
+    params = {
+        'latitude': lat,
+        'longitude': lon,
+        'start_date': start_date.strftime('%Y-%m-%d'),
+        'end_date': end_date.strftime('%Y-%m-%d'),
+        'hourly': 'temperature_2m',
+        'timezone': 'Asia/Kolkata'
+    }
+    
+    print("🔄 Fetching historical data from Open-Meteo...")
+    try:
+        response = requests.get(url, params=params, timeout=30)
+        response.raise_for_status()
+        data = response.json()
         
-        elif choice == "2":
-            show_all_data()
+        hourly = data['hourly']
+        times = [datetime.fromisoformat(t) for t in hourly['time']]
+        temps = hourly['temperature_2m']
         
-        elif choice == "3":
-            # ask for optional city filter
-            city_input = input("Enter city names separated by comma (leave blank for all): ").strip()
-            cities = [c.strip() for c in city_input.split(",")] if city_input else None
-            # optional date filters
-            sd = input("Start date (YYYY-MM-DD) or blank: ").strip()
-            ed = input("End date (YYYY-MM-DD) or blank: ").strip()
-            start_date = pd.to_datetime(sd) if sd else None
-            end_date = pd.to_datetime(ed) if ed else None
-            result = analyze_data(cities=cities, start_date=start_date, end_date=end_date)
-            print("\n✅ Analysis complete. Summary saved to analysis_result.json")
+        # Calculate day and night temperatures
+        days = []
+        day_temps = []
+        night_temps = []
         
-        elif choice == "4":
-            export_data()
+        current_date = start_date
+        while current_date <= end_date:
+            day_hours = []
+            night_hours = []
+            
+            for i, t in enumerate(times):
+                if t.date() == current_date:
+                    hour = t.hour
+                    if 10 <= hour <= 17:  # Day: 10 AM - 5 PM
+                        day_hours.append(temps[i])
+                    elif hour >= 22 or hour <= 6:  # Night: 10 PM - 6 AM
+                        night_hours.append(temps[i])
+            
+            if day_hours and night_hours:
+                days.append(current_date)
+                day_temps.append(max(day_hours))
+                night_temps.append(min(night_hours))
+            
+            current_date += timedelta(days=1)
         
-        elif choice == "5":
-            print("👋 Goodbye! Have a great day!")
+        # Create chart
+        plt.figure(figsize=(12, 6))
+        plt.plot(days, day_temps, marker='o', linewidth=2, label='Day (Max 10AM-5PM)', color='#FF6B6B')
+        plt.plot(days, night_temps, marker='s', linewidth=2, label='Night (Min 10PM-6AM)', color='#4ECDC4')
+        plt.fill_between(days, day_temps, night_temps, alpha=0.3, color='#95E1D3')
+        
+        plt.title(f'Weekly Temperature: {city}\nDay vs Night', fontsize=14, fontweight='bold')
+        plt.xlabel('Date', fontsize=12)
+        plt.ylabel('Temperature (°C)', fontsize=12)
+        plt.legend(loc='best')
+        plt.grid(True, alpha=0.3)
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        
+        # Show chart
+        print(f"✅ Displaying chart for {city}...")
+        plt.show()
+        
+    except Exception as e:
+        print(f"❌ Error: {e}")
+
+
+def export_csv():
+    """Option 6: Export data to CSV using Pandas"""
+    print("\n💾 EXPORTING DATA TO CSV")
+    
+    # Fetch all data from MongoDB
+    data = list(collection.find())
+    
+    if not data:
+        print("❌ No data to export")
+        return
+    
+    # Convert to DataFrame and export
+    df = pd.DataFrame(data)
+    
+    # Remove MongoDB _id field
+    if '_id' in df.columns:
+        df = df.drop('_id', axis=1)
+    
+    # Format timestamp
+    if 'timestamp' in df.columns:
+        df['timestamp'] = df['timestamp'].dt.strftime('%Y-%m-%d %I:%M:%S %p')
+    
+    filename = "weather_data.csv"
+    df.to_csv(filename, index=False)
+    print(f"✅ Data exported to: {filename}")
+    print(f"📊 Total records exported: {len(df)}")
+
+
+def main():
+    """Main application menu"""
+    print("=" * 60)
+    print("🌤️  WEATHER APP - MongoDB Edition")
+    print("=" * 60)
+    
+    while True:
+        print("\n" + "=" * 60)
+        print("MAIN MENU")
+        print("=" * 60)
+        print("1️⃣  Check Weather (Live + 1 Hour Cache)")
+        print("2️⃣  Basic Summary")
+        print("3️⃣  City-Level Summary")
+        print("4️⃣  Extreme Weather Days")
+        print("5️⃣  Weekly Temperature Chart (Day vs Night)")
+        print("6️⃣  Export to CSV")
+        print("7️⃣  Exit")
+        print("=" * 60)
+        
+        choice = input("\nEnter your choice (1-7): ").strip()
+        
+        if choice == '1':
+            city = input("Enter city name: ").strip()
+            if city:
+                check_weather(city)
+            else:
+                print("❌ City name cannot be empty")
+        
+        elif choice == '2':
+            basic_summary()
+        
+        elif choice == '3':
+            city = input("Enter city name: ").strip()
+            if city:
+                city_level_summary(city)
+            else:
+                print("❌ City name cannot be empty")
+        
+        elif choice == '4':
+            extreme_weather_days()
+        
+        elif choice == '5':
+            city = input("Enter city name: ").strip()
+            if city:
+                weekly_temperature_chart(city)
+            else:
+                print("❌ City name cannot be empty")
+        
+        elif choice == '6':
+            export_csv()
+        
+        elif choice == '7':
+            print("\n👋 Thank you for using Weather App!")
             break
         
         else:
-            print("⚠️ Invalid choice. Please select a number between 1–5.")
+            print("❌ Invalid choice. Please enter 1-7.")
+
 
 if __name__ == "__main__":
     main()

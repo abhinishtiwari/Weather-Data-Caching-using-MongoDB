@@ -11,6 +11,7 @@ from pymongo import MongoClient
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+import time
 
 # Configuration
 MONGO_URI = "mongodb://localhost:27017/"
@@ -356,6 +357,87 @@ def geocode_city(city):
     return None, None
 
 
+def update_existing_records_with_aqi(batch_limit=None, delay=1.0):
+    """Fetch and update AQI for existing DB entries missing AQI.
+
+    - batch_limit: optional int to limit number of updates in one run
+    - delay: seconds to sleep between API calls to avoid rate limits
+    """
+    # Find documents where 'aqi' is missing, null, empty, or zero
+    query = {
+        "$or": [
+            {"aqi": {"$exists": False}},
+            {"aqi": None},
+            {"aqi": ""},
+            {"aqi": 0}
+        ]
+    }
+
+    docs = list(collection.find(query))
+    total = len(docs)
+    if total == 0:
+        print("✔ All records already have AQI.")
+        return
+
+    print(f"🔄 Updating AQI for {total} old records (limit={batch_limit})...")
+
+    updated = 0
+    for i, doc in enumerate(docs):
+        if batch_limit is not None and updated >= batch_limit:
+            break
+
+        city = doc.get("city")
+        if not city:
+            continue
+
+        # Try geocoding first (safer than relying on old stored coords)
+        lat, lon = geocode_city(city)
+        if lat is None or lon is None:
+            print(f"⚠ Could not geocode {city}; skipping")
+            continue
+
+        pollution_url = f"http://api.openweathermap.org/data/2.5/air_pollution?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}"
+        try:
+            pr = requests.get(pollution_url, timeout=15)
+            pr.raise_for_status()
+            pjson = pr.json()
+            if pjson and pjson.get("list"):
+                info = pjson["list"][0]
+                aqi_val = info.get("main", {}).get("aqi")
+                components = info.get("components", {})
+                pm25 = components.get("pm2_5")
+                pm10 = components.get("pm10")
+
+                aqi_categories = {
+                    1: "Good",
+                    2: "Fair",
+                    3: "Moderate",
+                    4: "Poor",
+                    5: "Very Poor"
+                }
+                aqi_cat = aqi_categories.get(aqi_val, None)
+
+                update_fields = {
+                    "aqi": aqi_val,
+                    "aqi_category": aqi_cat,
+                    "pm25": pm25,
+                    "pm10": pm10
+                }
+
+                collection.update_one({"_id": doc["_id"]}, {"$set": update_fields})
+                updated += 1
+                print(f"✔ Updated AQI for {city} → {aqi_val}")
+            else:
+                print(f"⚠ AQI response empty for {city}")
+
+        except Exception as e:
+            print(f"⚠ AQI fetch failed for {city}: {e}")
+
+        time.sleep(delay)
+
+    print(f"🎉 Finished. Updated {updated} records (out of {total}).")
+
+
 def weekly_temperature_chart(city):
     """Option 5: Weekly temperature chart using Open-Meteo (no DB)"""
     print(f"\n📈 WEEKLY TEMPERATURE CHART: {city}")
@@ -484,7 +566,8 @@ def main():
         print("4️⃣  Extreme Weather Days")
         print("5️⃣  Weekly Temperature Chart (Day vs Night)")
         print("6️⃣  Export to CSV")
-        print("7️⃣  Exit")
+        print("7️⃣  Update missing AQI in DB")
+        print("8️⃣  Exit")
         print("=" * 60)
         
         choice = input("\nEnter your choice (1-7): ").strip()
@@ -518,8 +601,18 @@ def main():
         
         elif choice == '6':
             export_csv()
-        
         elif choice == '7':
+            # Run the AQI updater (ask user for optional batch size)
+            try:
+                n = input("Enter max records to update in this run (press Enter for no limit): ").strip()
+                limit = int(n) if n else None
+            except ValueError:
+                limit = None
+
+            print("Starting update of missing AQI fields...")
+            update_existing_records_with_aqi(batch_limit=limit)
+
+        elif choice == '8':
             print("\n👋 Thank you for using Weather App!")
             break
         
